@@ -1,0 +1,166 @@
+import torch  
+from torch import nn  
+from transformers import BertModel, BertTokenizer  
+from datasets import load_dataset  
+from torch.utils.data import DataLoader  
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support  
+
+# GPU check  
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  
+
+# Fusion Sentence Embedding Model  
+class SentenceEmbeddingModel(nn.Module):  
+    def __init__(self, model_name="bert-base-uncased", hidden_size=768):  
+        super().__init__()  
+        self.bert = BertModel.from_pretrained(model_name)  
+        self.hidden_size = hidden_size  # Typically 768 for BERT  
+        # Fusion weights (alpha, beta, gamma)  
+        self.alpha = nn.Parameter(torch.tensor(0.33), requires_grad=True)  
+        self.beta = nn.Parameter(torch.tensor(0.33), requires_grad=True)  
+        self.gamma = nn.Parameter(torch.tensor(0.34), requires_grad=True)  
+        # Attention query vector  
+        self.query_vector = nn.Parameter(torch.randn(hidden_size), requires_grad=True)  
+        # MRL (Russia Doll-style weighted pooling components)  
+        self.mlp1 = nn.Sequential(  
+            nn.Linear(hidden_size * 2, hidden_size),  
+            nn.Tanh()  
+        )  
+        self.mlp2 = nn.Sequential(  
+            nn.Linear(hidden_size * 2, 1),  
+            nn.Softmax(dim=1)  
+        )  
+
+    def average_pooling(self, embeddings, attention_mask):  
+        # Average Pooling  
+        mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()  
+        sum_embeddings = torch.sum(embeddings * mask_expanded, dim=1)  
+        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)  
+        avg_embeddings = sum_embeddings / sum_mask  
+        return avg_embeddings  
+
+    def attention_pooling(self, embeddings):  
+        # Attention Pooling  
+        attention_scores = torch.matmul(embeddings, self.query_vector)  
+        attention_weights = torch.softmax(attention_scores, dim=1).unsqueeze(-1)  
+        attended_embeddings = torch.sum(attention_weights * embeddings, dim=1)  
+        return attended_embeddings  
+
+    def mrl_weighted_pooling(self, embeddings, attention_mask):  
+        # Global embedding  
+        global_embedding = self.average_pooling(embeddings, attention_mask)  
+        # MRL Process  
+        mrl_features = []  
+        for token_embedding in embeddings:  
+            combined = torch.cat([token_embedding, global_embedding], dim=-1)  
+            mrl_out1 = self.mlp1(combined)  
+            mrl_features.append(mrl_out1)  
+        mrl_features = torch.stack(mrl_features, dim=1)  
+        # Attention scores  
+        combined2 = torch.cat([mrl_features, embeddings], dim=-1)  
+        weights = self.mlp2(combined2)  
+        weighted_embedding = torch.sum(weights * embeddings, dim=1)  # Weighted sum  
+        return weighted_embedding  
+
+    def forward(self, input_ids, attention_mask):  
+        outputs = self.bert(input_ids, attention_mask=attention_mask)  
+        embeddings = outputs.last_hidden_state  
+
+        avg_pooling = self.average_pooling(embeddings, attention_mask)  
+        attn_pooling = self.attention_pooling(embeddings)  
+        mrl_pooling = self.mrl_weighted_pooling(embeddings, attention_mask)  
+
+        # Fusion  
+        sentence_embedding = (  
+            self.alpha * avg_pooling +  
+            self.beta * attn_pooling +  
+            self.gamma * mrl_pooling  
+        )  
+        return sentence_embedding  
+
+
+# Classifier Model  
+class TextClassifier(nn.Module):  
+    def __init__(self, embedding_model, num_classes=2):  
+        super().__init__()  
+        self.embedding_model = embedding_model  
+        self.classifier = nn.Linear(embedding_model.hidden_size, num_classes)  
+
+    def forward(self, input_ids, attention_mask):  
+        sentence_embeddings = self.embedding_model(input_ids, attention_mask)  
+        outputs = self.classifier(sentence_embeddings)  
+        return outputs  
+
+
+# Load dataset  
+def load_imdb_dataset(batch_size=16, max_length=512):  
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")  
+    def preprocess_data(example):  
+        return tokenizer(example["text"], truncation=True, padding="max_length", max_length=max_length)  
+
+    dataset = load_dataset("imdb")  
+    dataset = dataset.map(preprocess_data, batched=True)  
+    dataset = dataset.rename_column("label", "labels")  
+    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])  
+
+    train_loader = DataLoader(dataset["train"], shuffle=True, batch_size=batch_size)  
+    test_loader = DataLoader(dataset["test"], batch_size=batch_size)  
+    return train_loader, test_loader  
+
+
+# Training and evaluation  
+def train(model, train_loader, optimizer, criterion, num_epochs=2):  
+    model.train()  
+    for epoch in range(num_epochs):  
+        total_loss = 0.0  
+        for batch in train_loader:  
+            input_ids, attention_mask, labels = (  
+                batch["input_ids"].to(device),  
+                batch["attention_mask"].to(device),  
+                batch["labels"].to(device),  
+            )  
+            optimizer.zero_grad()  
+            outputs = model(input_ids, attention_mask)  
+            loss = criterion(outputs, labels)  
+            loss.backward()  
+            optimizer.step()  
+            total_loss += loss.item()  
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_loader)}")  
+
+
+def evaluate(model, test_loader):  
+    model.eval()  
+    all_preds = []  
+    all_labels = []  
+    with torch.no_grad():  
+        for batch in test_loader:  
+            input_ids, attention_mask, labels = (  
+                batch["input_ids"].to(device),  
+                batch["attention_mask"].to(device),  
+                batch["labels"].to(device),  
+            )  
+            outputs = model(input_ids, attention_mask)  
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()  
+            all_preds.extend(list(preds))  
+            all_labels.extend(list(labels.cpu().numpy()))  
+    acc = accuracy_score(all_labels, all_preds)  
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="binary")  
+    print(f"Accuracy: {acc}, Precision: {precision}, Recall: {recall}, F1: {f1}")  
+
+
+if __name__ == "__main__":  
+    # Load dataset  
+    train_loader, test_loader = load_imdb_dataset()  
+
+    # Initialize model  
+    embedding_model = SentenceEmbeddingModel()  
+    model = TextClassifier(embedding_model).to(device)  
+
+    # Optimizer and loss function  
+    optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)  
+    criterion = nn.CrossEntropyLoss()  
+
+    # Train the model  
+    train(model, train_loader, optimizer, criterion)  
+
+    # Evaluate the model  
+    evaluate(model, test_loader)
